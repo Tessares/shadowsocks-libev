@@ -136,6 +136,23 @@ crypto_init(const char *password, const char *key, const char *method)
 {
     int i, m = -1;
 
+    if (method != NULL && strcmp(method, "plain") == 0) {
+        LOGI("No crypto is used");
+        crypto_t *crypto = (crypto_t *)ss_malloc(sizeof(crypto_t));
+        crypto_t tmp     = {
+            .cipher      = NULL,
+            .encrypt_all = &stream_nocrypt_plain_all,
+            .decrypt_all = &stream_nocrypt_plain_all,
+            .encrypt     = &stream_nocrypt_plain,
+            .decrypt     = &stream_nocrypt_plain,
+            .ctx_init    = &stream_plain_ctx_init,
+            .ctx_release = &stream_plain_ctx_release,
+        };
+        memcpy(crypto, &tmp, sizeof(crypto_t));
+
+        return crypto;
+    }
+
     entropy_check();
     // Initialize sodium for random generator
     if (sodium_init() == -1) {

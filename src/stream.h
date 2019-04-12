@@ -41,6 +41,14 @@
 
 #include "crypto.h"
 
+#ifndef UNUSED
+#ifdef __GNUC__
+#define UNUSED __attribute__((__unused__))
+#else
+#define UNUSED
+#endif
+#endif
+
 int stream_encrypt_all(buffer_t *, cipher_t *, size_t);
 int stream_decrypt_all(buffer_t *, cipher_t *, size_t);
 int stream_encrypt(buffer_t *, cipher_ctx_t *, size_t);
@@ -48,6 +56,19 @@ int stream_decrypt(buffer_t *, cipher_ctx_t *, size_t);
 
 void stream_ctx_init(cipher_t *, cipher_ctx_t *, int);
 void stream_ctx_release(cipher_ctx_t *);
+
+static int stream_nocrypt_plain_all(UNUSED buffer_t *b, UNUSED cipher_t *c, UNUSED size_t s) {
+        return CRYPTO_OK;
+}
+static int stream_nocrypt_plain(UNUSED buffer_t *b, UNUSED cipher_ctx_t *ctx, UNUSED size_t s) {
+        return CRYPTO_OK;
+}
+static void stream_plain_ctx_init(UNUSED cipher_t *c, UNUSED cipher_ctx_t *ctx, UNUSED int i) {
+        return;
+}
+static void stream_plain_ctx_release(UNUSED cipher_ctx_t *ctx) {
+        return;
+}
 
 cipher_t *stream_init(const char *pass, const char *key, const char *method);
 
