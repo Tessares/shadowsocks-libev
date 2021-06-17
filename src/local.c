@@ -1807,6 +1807,7 @@ main(int argc, char **argv)
         case GETOPT_VAL_CONVERTER:
             converter = 1;
             fast_open = 1;
+            mptcp = 1;
             method = "plain";
             LOGI("enable converter");
             break;
