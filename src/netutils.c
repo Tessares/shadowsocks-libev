@@ -137,6 +137,9 @@ get_sockaddr(char *host, char *port,
         return 0;
     } else {
 #ifdef __ANDROID__
+        // TODO: with the converter, vpn variable should not be ON
+        extern int converter;
+        if (converter) return -1;
         extern int vpn;
         assert(!vpn);   // protecting DNS packets isn't supported yet
 #endif

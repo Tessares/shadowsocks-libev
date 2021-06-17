@@ -126,6 +126,17 @@ endif ()
 add_library(ipset-shared SHARED ${LIBIPSET_SOURCE})
 set_target_properties(ipset-shared PROPERTIES OUTPUT_NAME ipset)
 
+set(LIBCONVERT_SOURCE
+        libconvert/convert_util.c
+        )
+
+if (WITH_STATIC)
+add_library(convert_util STATIC ${LIBCONVERT_SOURCE})
+endif ()
+
+add_library(convert_util-shared SHARED ${LIBCONVERT_SOURCE})
+set_target_properties(convert_util-shared PROPERTIES OUTPUT_NAME convert_util)
+
 set(LIBBLOOM_SOURCE
         libbloom/bloom.c
         libbloom/murmur2/MurmurHash2.c
@@ -133,14 +144,13 @@ set(LIBBLOOM_SOURCE
 
 if (WITH_STATIC)
 add_library(bloom STATIC ${LIBBLOOM_SOURCE})
-target_link_libraries(ipset cork bloom)
+target_link_libraries(convert_util ipset cork bloom)
 endif ()
 
 add_library(bloom-shared SHARED ${LIBBLOOM_SOURCE})
-target_link_libraries(ipset-shared cork-shared bloom-shared)
+target_link_libraries(convert_util-shared ipset-shared cork-shared bloom-shared)
 set_target_properties(bloom-shared PROPERTIES OUTPUT_NAME bloom)
 endif ()
 
 add_subdirectory(src)
 add_subdirectory(doc)
-

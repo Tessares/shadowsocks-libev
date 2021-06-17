@@ -61,6 +61,8 @@
 #include "local.h"
 #include "winsock.h"
 
+#include <convert_util.h>
+
 #ifndef LIB_ONLY
 #ifdef __APPLE__
 #include <AvailabilityMacros.h>
@@ -102,6 +104,7 @@ static int acl       = 0;
 static int mode      = TCP_ONLY;
 static int ipv6first = 0;
        int fast_open = 0;
+       int converter = 0;
 static int no_delay  = 0;
 static int udp_fd    = 0;
 static int ret_val   = 0;
@@ -331,6 +334,54 @@ server_handshake_reply(EV_P_ ev_io *w, int udp_assc, struct socks5_response *res
     return 0;
 }
 
+/* Converter function. Should go to convert_util.h. */
+static void
+_to_v4mapped(in_addr_t from, struct in6_addr *to)
+{
+	*to = (struct in6_addr) {
+		.s6_addr32 = {
+			0, 0, htonl(0xffff), from,
+		},
+	};
+}
+
+/* Converter function. Should go to convert_util.h. */
+static ssize_t
+_redirect_connect_tlv(uint8_t *buf, size_t buf_len, struct sockaddr *addr)
+{
+	ssize_t			ret;
+	struct convert_opts	opts = { 0 };
+
+	opts.flags = CONVERT_F_CONNECT;
+
+	switch (addr->sa_family) {
+	case AF_INET: {
+		struct sockaddr_in *in = (struct sockaddr_in *)addr;
+
+		/* already in network bytes */
+		_to_v4mapped(in->sin_addr.s_addr, &opts.remote_addr.sin6_addr);
+		opts.remote_addr.sin6_port = in->sin_port;
+		break;
+	}
+	case AF_INET6: {
+		struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr;
+
+		/* already in network bytes */
+		memcpy(&opts.remote_addr, &in6->sin6_addr, sizeof(opts.remote_addr));
+		break;
+	}
+	default:
+		return -EAFNOSUPPORT;
+	}
+
+	ret = convert_write(buf, buf_len, &opts);
+	if (ret < 0) {
+		LOGE("unable to allocate the convert header");
+		ret = -EOPNOTSUPP;
+	}
+	return ret;
+}
+
 static int
 server_handshake(EV_P_ ev_io *w, buffer_t *buf)
 {
@@ -340,6 +391,8 @@ server_handshake(EV_P_ ev_io *w, buffer_t *buf)
 
     struct socks5_request *request = (struct socks5_request *)buf->data;
     size_t request_len             = sizeof(struct socks5_request);
+
+    LOGD("handshake, remote %p, server %p", remote, server);
 
     if (buf->len < request_len) {
         return -1;
@@ -381,10 +434,12 @@ server_handshake(EV_P_ ev_io *w, buffer_t *buf)
         if (buf->len < request_len + in_addr_len + 2) {
             return -1;
         }
+        LOGD("building address buffer IPv4: remote %p, server %p, acl %d",
+             remote, server, acl);
         memcpy(abuf->data + abuf->len, buf->data + request_len, in_addr_len + 2);
         abuf->len += in_addr_len + 2;
 
-        if (acl || verbose) {
+        if (converter || acl || verbose) {
             uint16_t p = ntohs(*(uint16_t *)(buf->data + request_len + in_addr_len));
             if (!inet_ntop(AF_INET, (const void *)(buf->data + request_len),
                            ip, INET_ADDRSTRLEN)) {
@@ -392,32 +447,58 @@ server_handshake(EV_P_ ev_io *w, buffer_t *buf)
                 ip[0] = '\0';
             }
             sprintf(port, "%d", p);
+
+            /* For the converter, we need to build a sockaddr */
+            if (converter) {
+                memset(&server->addr, 0, sizeof(struct sockaddr_storage));
+                get_sockaddr(ip, port, &server->addr, 0, ipv6first);
+                LOGD("building address structure IPv4: remote %p, server %p, %s:%s",
+                     remote, server, ip, port);
+            }
         }
     } else if (atyp == SOCKS5_ATYP_DOMAIN) {
         uint8_t name_len = *(uint8_t *)(buf->data + request_len);
         if (buf->len < request_len + 1 + name_len + 2) {
             return -1;
         }
+        LOGD("building address buffer domain: remote %p, server %p, acl %d",
+             remote, server, acl);
         abuf->data[abuf->len++] = name_len;
         memcpy(abuf->data + abuf->len, buf->data + request_len + 1, name_len + 2);
         abuf->len += name_len + 2;
 
-        if (acl || verbose) {
+        if (converter || acl || verbose) {
             uint16_t p =
                 ntohs(*(uint16_t *)(buf->data + request_len + 1 + name_len));
             memcpy(host, buf->data + request_len + 1, name_len);
             host[name_len] = '\0';
             sprintf(port, "%d", p);
+
+            /* For the converter, we need to build a sockaddr */
+            if (converter) {
+                memset(&server->addr, 0, sizeof(struct sockaddr_storage));
+                get_sockaddr(host, port, &server->addr, 0, ipv6first);
+                if (verbose) {
+                    if (server->addr.ss_family == AF_INET) {
+                        struct sockaddr_in *sin = (struct sockaddr_in *)&server->addr;
+                        unsigned char *uip = (unsigned char *)&sin->sin_addr.s_addr;
+                        LOGI("building address structure host: remote %p, server %p, ip: %d %d %d %d:%s (%s)",
+                             remote, server, uip[0], uip[1], uip[2], uip[3], port, host);
+                    }
+                }
+            }
         }
     } else if (atyp == SOCKS5_ATYP_IPV6) {
         size_t in6_addr_len = sizeof(struct in6_addr);
         if (buf->len < request_len + in6_addr_len + 2) {
             return -1;
         }
+        LOGD("building address buffer IPv6: remote %p, server %p, acl %d",
+             remote, server, acl);
         memcpy(abuf->data + abuf->len, buf->data + request_len, in6_addr_len + 2);
         abuf->len += in6_addr_len + 2;
 
-        if (acl || verbose) {
+        if (converter || acl || verbose) {
             uint16_t p = ntohs(*(uint16_t *)(buf->data + request_len + in6_addr_len));
             if (!inet_ntop(AF_INET6, (const void *)(buf->data + request_len),
                            ip, INET6_ADDRSTRLEN)) {
@@ -425,6 +506,14 @@ server_handshake(EV_P_ ev_io *w, buffer_t *buf)
                 ip[0] = '\0';
             }
             sprintf(port, "%d", p);
+
+            /* For the converter, we need to build a sockaddr */
+            if (converter) {
+                memset(&server->addr, 0, sizeof(struct sockaddr_storage));
+                get_sockaddr(ip, port, &server->addr, 0, ipv6first);
+                LOGD("building address structure IPv6: remote %p, server %p, %s:%s",
+                     remote, server, ip, port);
+            }
         }
     } else {
         LOGE("unsupported addrtype: %d", request->atyp);
@@ -478,18 +567,29 @@ server_handshake(EV_P_ ev_io *w, buffer_t *buf)
 
     if (verbose) {
         if (sni_detected || atyp == SOCKS5_ATYP_DOMAIN)
-            LOGI("connect to %s:%s", host, port);
+            LOGI("connect to host, remote %p, server %p, %s:%s",
+                 remote, server, host, port);
         else if (atyp == SOCKS5_ATYP_IPV4)
-            LOGI("connect to %s:%s", ip, port);
+            LOGI("connect to ipv4, remote %p, server %p, %s:%s",
+                 remote, server, ip, port);
         else if (atyp == SOCKS5_ATYP_IPV6)
-            LOGI("connect to [%s]:%s", ip, port);
+            LOGI("connect to ipv6, remote %p, server %p, [%s]:%s",
+                 remote, server, ip, port);
     }
+
+    LOGD("acl case? remote %p, server %p, acl: %d", remote, server, acl);
+#ifdef __ANDROID__
+    LOGD("android: remote %p, server %p, vpn %d, port %s, converter %d",
+         remote, server, vpn, port, converter);
+#endif
 
     if (acl
 #ifdef __ANDROID__
         && !(vpn && strcmp(port, "53") == 0)
 #endif
         ) {
+        LOGD("acl case (and not vpn + port 53), remote %p, server %p",
+             remote, server);
         int bypass   = 0;
         int resolved = 0;
         struct sockaddr_storage storage;
@@ -510,6 +610,8 @@ server_handshake(EV_P_ ev_io *w, buffer_t *buf)
                 && !vpn
 #endif
                 ) {           // resolve domain so we can bypass domain with geoip
+                LOGD("acl get_sockaddr host: remote %p, server %p, %s:%s",
+                     remote, server, host, port);
                 if (get_sockaddr(host, port, &storage, 0, ipv6first))
                     goto not_bypass;
                 resolved = 1;
@@ -532,6 +634,7 @@ server_handshake(EV_P_ ev_io *w, buffer_t *buf)
                     goto not_bypass;
                 }
             }
+            LOGD("acl get_sockaddr ip remote %p, server %p", remote, server);
 
             int ip_match = (resolved || atyp == SOCKS5_ATYP_IPV4
                     || atyp == SOCKS5_ATYP_IPV6) ? acl_match_host(ip) : 0;
@@ -568,6 +671,8 @@ server_handshake(EV_P_ ev_io *w, buffer_t *buf)
             else
                 err = get_sockaddr(ip, port, &storage, 0, ipv6first);
             if (err != -1) {
+                LOGD("create remote: remote %p, server %p, %s:%s",
+                     remote, server, ip, port);
                 remote = create_remote(server->listener, (struct sockaddr *)&storage, 1);
             }
         }
@@ -576,6 +681,7 @@ server_handshake(EV_P_ ev_io *w, buffer_t *buf)
 not_bypass:
     // Not bypass
     if (remote == NULL) {
+        LOGD("create remote not bypass remote %p, server %p", remote, server);
         remote = create_remote(server->listener, NULL, 0);
 
         if (sni_detected && acl
@@ -584,6 +690,8 @@ not_bypass:
 #endif
             ) {
             // Reconstruct address buffer
+            LOGD("reconstruct address buffer remote %p, server %p",
+                 remote, server);
             abuf->len               = 0;
             abuf->data[abuf->len++] = 3;
             abuf->data[abuf->len++] = hostname_len;
@@ -592,6 +700,13 @@ not_bypass:
             dst_port   = htons(dst_port);
             memcpy(abuf->data + abuf->len, &dst_port, 2);
             abuf->len += 2;
+            /* for the converter, we don't need abuf, we will use the addr
+             * generate what has to be sent
+             */
+            if (converter) {
+                memset(&server->addr, 0, sizeof(struct sockaddr_storage));
+                get_sockaddr(host, port, &server->addr, 0, ipv6first);
+            }
         }
     }
 
@@ -611,9 +726,30 @@ not_bypass:
         }
     }
 
+    LOGD("Prepare data to send: remote %p, server %p, data %p, len %zu",
+         remote, server, remote->buf->data, buf->len);
     if (buf->len > 0) {
-        memcpy(remote->buf->data, buf->data, buf->len);
-        remote->buf->len = buf->len;
+        /* For the converter, we have to discuss "converter" (SYNs) and then
+         * exchange data. remote->buf->data will then be filled with the info
+         * for the converter. The rest of the data needs to be in a different
+         * buffer (converter_buf) to be sent later. We could share remote->buf
+         * as it is done at other places but better not to complexify even more
+         * the code related to that!
+         */
+        buffer_t *dest_buf;
+        if (converter) {
+            LOGD("store temp in converter for the moment remote %p, server %p",
+                 remote, server);
+            dest_buf = remote->converter_buf;
+        } else {
+            dest_buf = remote->buf;
+        }
+
+        memcpy(dest_buf->data, buf->data, buf->len);
+        dest_buf->len = buf->len;
+    } else if (converter) {
+        remote->converter_buf->idx = 0;
+        remote->converter_buf->len = 0;
     }
 
     server->remote = remote;
@@ -656,7 +792,23 @@ server_stream(EV_P_ ev_io *w, buffer_t *buf)
         }
 
         if (server->abuf) {
-            bprepend(remote->buf, server->abuf, BUF_SIZE);
+            struct sockaddr_in *in = (struct sockaddr_in *)&(server->addr);
+            if (converter && in->sin_port != 53) {
+                int len;
+                LOGD("converter redirect, remote %p, server %p",
+                     remote, server);
+                len = _redirect_connect_tlv((uint8_t *)remote->buf->data,
+                                            remote->buf->capacity,
+                                            (struct sockaddr *)&(server->addr));
+                if (len < 0)
+                    LOGE("error while converting to convert: %d", len);
+                else
+                    remote->buf->len = len;
+                LOGD("convert: connection, remote %p, server %p, len %d",
+                     remote, server, len);
+            } else {
+                bprepend(remote->buf, server->abuf, BUF_SIZE);
+            }
             bfree(server->abuf);
             ss_free(server->abuf);
             server->abuf = NULL;
@@ -665,6 +817,7 @@ server_stream(EV_P_ ev_io *w, buffer_t *buf)
 
     if (!remote->send_ctx->connected) {
 #ifdef __ANDROID__
+        LOGD("not connected, remote %p, server %p", remote, server);
         if (vpn) {
             int not_protect = 0;
             if (remote->addr.ss_family == AF_INET) {
@@ -699,10 +852,14 @@ server_stream(EV_P_ ev_io *w, buffer_t *buf)
             // wait on remote connected event
             ev_io_stop(EV_A_ & server_recv_ctx->io);
             ev_io_start(EV_A_ & remote->send_ctx->io);
+            LOGD("%s:%d: stop s/recv, start r/send: remote %p, server %p",
+                 __func__, __LINE__, remote, server);
             ev_timer_start(EV_A_ & remote->send_ctx->watcher);
         } else {
 #if defined(MSG_FASTOPEN) && !defined(TCP_FASTOPEN_CONNECT)
             int s = -1;
+            LOGD("fastopen: connect: remote %p, server %p, data %p, len %zu",
+                 remote, server, remote->buf->data, remote->buf->len);
             s = sendto(remote->fd, remote->buf->data, remote->buf->len, MSG_FASTOPEN,
                        (struct sockaddr *)&(remote->addr), remote->addr_len);
 #elif defined(TCP_FASTOPEN_WINSOCK)
@@ -775,10 +932,14 @@ server_stream(EV_P_ ev_io *w, buffer_t *buf)
 #endif
             if (s == -1) {
                 if (errno == CONNECT_IN_PROGRESS) {
+                    LOGD("fastopen error: Connect in progress: remote %p, server %p",
+                         remote, server);
                     // in progress, wait until connected
                     remote->buf->idx = 0;
                     ev_io_stop(EV_A_ & server_recv_ctx->io);
                     ev_io_start(EV_A_ & remote->send_ctx->io);
+                    LOGD("%s:%d: stop s/recv, start r/send: remote %p, server %p",
+                         __func__, __LINE__, remote, server);
                     return;
                 } else {
                     if (errno == EOPNOTSUPP || errno == EPROTONOSUPPORT ||
@@ -794,11 +955,24 @@ server_stream(EV_P_ ev_io *w, buffer_t *buf)
                     return;
                 }
             } else {
+                LOGD("fastopen: connect: remote %p, server %p, data %p, len %zu, idx %zu, sent %d",
+                     remote, server, remote->buf->data, remote->buf->len, remote->buf->idx, s);
+                /* With the converter, we will only send Converter stuff in the
+                 * first packet intercepted in a SYN queue. Once we are
+                 * connected (converter discussions are over), we will send the
+                 * rest stored in another buffer, not in remote->buf but
+                 * remote->converter_buf.
+                 */
+                if (converter)
+                    remote->buf->idx = 0;
+                else
+                    remote->buf->idx = s;
                 remote->buf->len -= s;
-                remote->buf->idx  = s;
 
                 ev_io_stop(EV_A_ & server_recv_ctx->io);
                 ev_io_start(EV_A_ & remote->send_ctx->io);
+                LOGD("%s:%d: stop s/recv, start r/send: remote %p, server %p",
+                     __func__, __LINE__, remote, server);
                 ev_timer_start(EV_A_ & remote->send_ctx->watcher);
                 return;
             }
@@ -811,6 +985,8 @@ server_stream(EV_P_ ev_io *w, buffer_t *buf)
                 remote->buf->idx = 0;
                 ev_io_stop(EV_A_ & server_recv_ctx->io);
                 ev_io_start(EV_A_ & remote->send_ctx->io);
+                LOGD("%s:%d: stop s/recv, start r/send: remote %p, server %p",
+                     __func__, __LINE__, remote, server);
                 return;
             } else {
                 ERROR("server_recv_cb_send");
@@ -821,9 +997,8 @@ server_stream(EV_P_ ev_io *w, buffer_t *buf)
         } else if (s < (int)(remote->buf->len)) {
             remote->buf->len -= s;
             remote->buf->idx  = s;
-            ev_io_stop(EV_A_ & server_recv_ctx->io);
-            ev_io_start(EV_A_ & remote->send_ctx->io);
             return;
+            // wait for an EAGAIN/EWOULDBLOCK to stop the ev io
         } else {
             remote->buf->idx = 0;
             remote->buf->len = 0;
@@ -844,15 +1019,24 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 
     if (remote == NULL) {
         buf = server->buf;
+    } else if (converter && !remote->recv_ctx->connected) {
+        /* We have data but we are going to connect: store data in converter buf */
+        LOGD("server_recv_cb: converter not connected: remote %p, server %p "
+             "server stage: %d", remote, server, server->stage);
+        buf = remote->converter_buf;
     } else {
         buf = remote->buf;
     }
+    LOGD("server_recv_cb: remote %p, server %p, revents %d", remote, server, revents);
 
     if (revents != EV_TIMER) {
         r = recv(server->fd, buf->data + buf->len, BUF_SIZE - buf->len, 0);
+        LOGD("server_recv_cb: no timer: remote %p, server %p, recv %zd", remote, server, r);
 
         if (r == 0) {
             // connection closed
+            LOGD("server_recv_cb: closing: remote %p, server %p, connected: %d",
+                 remote, server, remote ? remote->recv_ctx->connected : -1);
             close_and_free_remote(EV_A_ remote);
             close_and_free_server(EV_A_ server);
             return;
@@ -915,6 +1099,8 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             server->stage = STAGE_HANDSHAKE;
 
             if (method_len < (int)(buf->len)) {
+                LOGD("memmove: remote %p, server %p, len %zu, method_len %d",
+                     remote, server, buf->len, method_len);
                 memmove(buf->data, buf->data + method_len, buf->len - method_len);
                 buf->len -= method_len;
                 continue;
@@ -937,8 +1123,14 @@ server_send_cb(EV_P_ ev_io *w, int revents)
     server_ctx_t *server_send_ctx = (server_ctx_t *)w;
     server_t *server              = server_send_ctx->server;
     remote_t *remote              = server->remote;
+
+    LOGD("server_send_cb: remote %p, server %p, len %zu, idx %zu",
+         remote, server, server->buf->len, server->buf->idx);
+
     if (server->buf->len == 0) {
         // close and free
+        LOGI("server_send_cb: closing: remote %p, server %p, connected: %d",
+             remote, server, remote->recv_ctx->connected);
         close_and_free_remote(EV_A_ remote);
         close_and_free_server(EV_A_ server);
         return;
@@ -964,6 +1156,8 @@ server_send_cb(EV_P_ ev_io *w, int revents)
             server->buf->idx = 0;
             ev_io_stop(EV_A_ & server_send_ctx->io);
             ev_io_start(EV_A_ & remote->recv_ctx->io);
+            LOGD("%s:%d: stop s/send, start r/recv: remote %p, server %p",
+                 __func__, __LINE__, remote, server);
             return;
         }
     }
@@ -1005,11 +1199,26 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
     remote_ctx_t *remote_recv_ctx = (remote_ctx_t *)w;
     remote_t *remote              = remote_recv_ctx->remote;
     server_t *server              = remote->server;
+    ssize_t r;
 
-    ssize_t r = recv(remote->fd, server->buf->data, BUF_SIZE, 0);
+    if (converter && !remote->recv_ctx->connected) {
+        char buf[BUF_SIZE];
+        r = recv(remote->fd, buf, BUF_SIZE, 0);
+        if (r >= 0)
+            buf[r] = '\0';
+        LOGD("converter: received %zd bytes (%s), dropping this",
+             r, r >= 0 ? buf : NULL);
+        /* TODO: converter check output */
+    } else {
+        r = recv(remote->fd, server->buf->data, BUF_SIZE, 0);
+    }
+    LOGD("remote_recv_cb: remote %p, server %p, connected: %d, recv %zd",
+         remote, server, remote->recv_ctx->connected, r);
 
     if (r == 0) {
         // connection closed
+        LOGD("remote_recv_cb: closing: remote %p, server %p, connected: %d",
+             remote, server, remote->recv_ctx->connected);
         close_and_free_remote(EV_A_ remote);
         close_and_free_server(EV_A_ server);
         return;
@@ -1025,6 +1234,14 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
             return;
         }
     }
+
+    /* With the converter, we need to wait for the end of the converter
+     * protocol discussion before sending more data. The discussion is now over,
+     * we can send data we accumulated. We don't have anything to send to the
+     * server yet.
+     */
+    if (converter && !remote->recv_ctx->connected)
+        goto no_send_server;
 
     server->buf->len = r;
 
@@ -1052,6 +1269,8 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
             server->buf->idx = 0;
             ev_io_stop(EV_A_ & remote_recv_ctx->io);
             ev_io_start(EV_A_ & server->send_ctx->io);
+            LOGD("%s:%d: stop r/recv, start s/send: remote %p, server %p",
+                 __func__, __LINE__, remote, server);
         } else {
             ERROR("remote_recv_cb_send");
             close_and_free_remote(EV_A_ remote);
@@ -1063,14 +1282,53 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
         server->buf->idx  = s;
         ev_io_stop(EV_A_ & remote_recv_ctx->io);
         ev_io_start(EV_A_ & server->send_ctx->io);
+        LOGD("%s:%d: stop r/recv, start s/send: remote %p, server %p",
+             __func__, __LINE__, remote, server);
     }
 
+no_send_server:
     // Disable TCP_NODELAY after the first response are sent
     if (!remote->recv_ctx->connected && !no_delay) {
         int opt = 0;
         setsockopt(server->fd, SOL_TCP, TCP_NODELAY, &opt, sizeof(opt));
         setsockopt(remote->fd, SOL_TCP, TCP_NODELAY, &opt, sizeof(opt));
     }
+
+    /* With the converter, we need to wait for the end of the converter
+     * protocol discussion before sending more data. The discussion is now over,
+     * we can send data we accumulated.
+     */
+    if (converter && !remote->recv_ctx->connected) {
+        if (remote->converter_buf->len > 0) {
+            LOGD("move data from converter_buf: remote %p, server %p, %zu (offset: %zu, idx: %zu)",
+                 remote, server, remote->converter_buf->len, remote->buf->len, remote->buf->idx);
+
+            memcpy(remote->buf->data + remote->buf->len, remote->converter_buf->data, remote->converter_buf->len);
+            remote->buf->len += remote->converter_buf->len;
+        }
+
+        bfree(remote->converter_buf);
+        ss_free(remote->converter_buf);
+        remote->converter_buf = NULL;
+
+        if (remote->buf->len == 0)
+            goto end;
+
+        if (remote->buf->len > 0) {
+            ev_io_stop(EV_A_ & server->recv_ctx->io);
+            ev_io_start(EV_A_ & remote->send_ctx->io);
+            LOGD("%s:%d: stop s/recv, start r/send: remote %p, server %p",
+                    __func__, __LINE__, remote, server);
+        } else {
+            LOGD("remote_recv_cb: Converter, no data in our buffer: "
+                 "remote %p, server %p, rlen: %zu, ridx: %zu",
+                 remote, server, remote->buf->len, remote->buf->idx);
+        }
+    }
+
+end:
+    LOGD("%s:%d: remote connected: remote %p, server %p",
+         __func__, __LINE__, remote, server);
     remote->recv_ctx->connected = 1;
 }
 
@@ -1080,6 +1338,9 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
     remote_ctx_t *remote_send_ctx = (remote_ctx_t *)w;
     remote_t *remote              = remote_send_ctx->remote;
     server_t *server              = remote->server;
+
+    LOGD("remote_send_cb: remote %p, server %p, connected: %d",
+         remote, server, remote_send_ctx->connected);
 
     if (!remote_send_ctx->connected) {
 #ifdef TCP_FASTOPEN_WINSOCK
@@ -1120,11 +1381,20 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
             remote_send_ctx->connected = 1;
             ev_timer_stop(EV_A_ & remote_send_ctx->watcher);
             ev_io_start(EV_A_ & remote->recv_ctx->io);
+            LOGD("%s:%d: only start r/recv: remote %p, server %p",
+                 __func__, __LINE__, remote, server);
+
+            LOGD("remote_send_cb: now connected remote %p, server %p, len %zu, "
+                "idx %zu, conv buf %p, conv buf len %zu", remote, server,
+                remote->buf->len, remote->buf->idx, remote->converter_buf,
+                remote->converter_buf ? remote->converter_buf->len : 0);
 
             // no need to send any data
             if (remote->buf->len == 0) {
                 ev_io_stop(EV_A_ & remote_send_ctx->io);
                 ev_io_start(EV_A_ & server->recv_ctx->io);
+                LOGD("%s:%d: stop r/send, start s/recv: remote %p, server %p",
+                     __func__, __LINE__, remote, server);
                 return;
             }
         } else {
@@ -1136,8 +1406,13 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
         }
     }
 
+    LOGD("remote_send_cb: remote %p, server %p, len %zu, idx %zu",
+         remote, server, remote->buf->len, remote->buf->idx);
+
     if (remote->buf->len == 0) {
         // close and free
+        LOGD("remote_send_cb: closing: remote %p, server %p, connected: %d",
+             remote, server, remote->recv_ctx->connected);
         close_and_free_remote(EV_A_ remote);
         close_and_free_server(EV_A_ server);
         return;
@@ -1164,6 +1439,8 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
             remote->buf->idx = 0;
             ev_io_stop(EV_A_ & remote_send_ctx->io);
             ev_io_start(EV_A_ & server->recv_ctx->io);
+            LOGD("%s:%d: stop r/send, start s/recv: remote %p, server %p",
+                 __func__, __LINE__, remote, server);
         }
     }
 }
@@ -1177,9 +1454,11 @@ new_remote(int fd, int timeout)
     memset(remote, 0, sizeof(remote_t));
 
     remote->buf      = ss_malloc(sizeof(buffer_t));
+    remote->converter_buf = ss_malloc(sizeof(buffer_t));
     remote->recv_ctx = ss_malloc(sizeof(remote_ctx_t));
     remote->send_ctx = ss_malloc(sizeof(remote_ctx_t));
     balloc(remote->buf, BUF_SIZE);
+    balloc(remote->converter_buf, BUF_SIZE);
     memset(remote->recv_ctx, 0, sizeof(remote_ctx_t));
     memset(remote->send_ctx, 0, sizeof(remote_ctx_t));
     remote->recv_ctx->connected = 0;
@@ -1206,6 +1485,10 @@ free_remote(remote_t *remote)
         bfree(remote->buf);
         ss_free(remote->buf);
     }
+    if (remote->converter_buf != NULL) {
+        bfree(remote->converter_buf);
+        ss_free(remote->converter_buf);
+    }
     ss_free(remote->recv_ctx);
     ss_free(remote->send_ctx);
     ss_free(remote);
@@ -1218,6 +1501,8 @@ close_and_free_remote(EV_P_ remote_t *remote)
         ev_timer_stop(EV_A_ & remote->send_ctx->watcher);
         ev_io_stop(EV_A_ & remote->send_ctx->io);
         ev_io_stop(EV_A_ & remote->recv_ctx->io);
+        LOGD("%s:%d: stop both r/send r/recv: remote %p",
+                __func__, __LINE__, remote);
         close(remote->fd);
         free_remote(remote);
     }
@@ -1297,6 +1582,8 @@ close_and_free_server(EV_P_ server_t *server)
     if (server != NULL) {
         ev_io_stop(EV_A_ & server->send_ctx->io);
         ev_io_stop(EV_A_ & server->recv_ctx->io);
+        LOGD("%s:%d: stop both s/send s/recv: server %p",
+             __func__, __LINE__, server);
         ev_timer_stop(EV_A_ & server->delayed_connect_watcher);
         close(server->fd);
         free_server(server);
@@ -1438,6 +1725,8 @@ accept_cb(EV_P_ ev_io *w, int revents)
     server->listener = listener;
 
     ev_io_start(EV_A_ & server->recv_ctx->io);
+    LOGD("%s:%d: only start s/recv: server %p",
+         __func__, __LINE__, server);
 }
 
 #ifndef LIB_ONLY
@@ -1479,6 +1768,7 @@ main(int argc, char **argv)
         { "acl",         required_argument, NULL, GETOPT_VAL_ACL         },
         { "mtu",         required_argument, NULL, GETOPT_VAL_MTU         },
         { "mptcp",       no_argument,       NULL, GETOPT_VAL_MPTCP       },
+        { "converter",   no_argument,       NULL, GETOPT_VAL_CONVERTER   },
         { "plugin",      required_argument, NULL, GETOPT_VAL_PLUGIN      },
         { "plugin-opts", required_argument, NULL, GETOPT_VAL_PLUGIN_OPTS },
         { "password",    required_argument, NULL, GETOPT_VAL_PASSWORD    },
@@ -1513,6 +1803,12 @@ main(int argc, char **argv)
         case GETOPT_VAL_MPTCP:
             mptcp = 1;
             LOGI("enable multipath TCP");
+            break;
+        case GETOPT_VAL_CONVERTER:
+            converter = 1;
+            fast_open = 1;
+            method = "plain";
+            LOGI("enable converter");
             break;
         case GETOPT_VAL_NODELAY:
             no_delay = 1;

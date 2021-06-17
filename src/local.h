@@ -70,6 +70,7 @@ typedef struct server {
 
     buffer_t *buf;
     buffer_t *abuf;
+    struct sockaddr_storage addr;
 
     ev_timer delayed_connect_watcher;
 
@@ -95,6 +96,11 @@ typedef struct remote {
 #endif
 
     buffer_t *buf;
+
+    /* With the converter, we need to wait for the end of the converter
+     * protocol discussion before sending more data. Store these data there.
+     */
+    buffer_t *converter_buf;
 
     struct remote_ctx *recv_ctx;
     struct remote_ctx *send_ctx;

@@ -132,6 +132,7 @@ list(APPEND DEPS_SHARED
         bloom-shared
         cork-shared
         ipset-shared
+        convert_util-shared
         ${LIBEV_SHARED}
         ${LIBUDNS_SHARED}
         ${LIBPCRE_SHARED}
@@ -143,11 +144,13 @@ else ()
 find_library(LIBBLOOM_SHARED bloom)
 find_library(LIBCORK_SHARED cork)
 find_library(LIBCORKIPSET_SHARED corkipset)
+find_library(LIBCONVERT_SHARED conver_util)
 list(APPEND DEPS_SHARED
         m
         ${LIBBLOOM_SHARED}
         ${LIBCORK_SHARED}
         ${LIBCORKIPSET_SHARED}
+        ${LIBCONVERT_UTIL_SHARED}
         ${LIBEV_SHARED}
         ${LIBUDNS_SHARED}
         ${LIBPCRE_SHARED}
@@ -182,12 +185,12 @@ target_compile_definitions(ss-local PUBLIC -DMODULE_LOCAL)
 target_compile_definitions(ss-redir PUBLIC -DMODULE_REDIR)
 target_compile_definitions(shadowsocks-libev PUBLIC -DMODULE_LOCAL)
 
-target_link_libraries(ss-server cork ipset ${DEPS})
-target_link_libraries(ss-tunnel cork ${DEPS})
-target_link_libraries(ss-manager m bloom cork ${LIBEV} ${LIBUDNS})
-target_link_libraries(ss-local cork ipset ${DEPS})
-target_link_libraries(ss-redir cork ipset ${DEPS})
-target_link_libraries(shadowsocks-libev cork ipset ${DEPS})
+target_link_libraries(ss-server convert_util cork ipset ${DEPS})
+target_link_libraries(ss-tunnel convert_util cork ${DEPS})
+target_link_libraries(ss-manager m bloom convert_util cork ${LIBEV} ${LIBUDNS})
+target_link_libraries(ss-local convert_util cork ipset ${DEPS})
+target_link_libraries(ss-redir convert_util cork ipset ${DEPS})
+target_link_libraries(shadowsocks-libev convert_util cork ipset ${DEPS})
 endif ()
 
 # ------------------------------------------------------------------

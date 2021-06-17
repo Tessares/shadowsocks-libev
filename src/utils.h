@@ -190,6 +190,12 @@ extern int use_syslog;
 
 #endif // if __ANDROID__
 
+#define LOGD(...)              \
+    do {                       \
+        if (verbose)           \
+            LOGI(__VA_ARGS__); \
+    } while(0)
+
 // Workaround for "%z" in Windows printf
 #ifdef __MINGW32__
 #define SSIZE_FMT "%Id"

@@ -10,3 +10,7 @@
 	path = libbloom
 	url = https://github.com/shadowsocks/libbloom.git
     ignore = dirty
+[submodule "libconvert"]
+	path = libconvert
+	url = https://github.com/Tessares/libconvert.git
+    ignore = dirty
